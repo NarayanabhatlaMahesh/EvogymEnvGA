@@ -17,9 +17,11 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 from Experiments import views
+from evogymRL import views as evogymViews
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('run_experiment/', views.run_experiment, name='home'),
-    path("api-auth/", include("rest_framework.urls"))
+    path("api-auth/", include("rest_framework.urls")),
+    path('evogymrl/',evogymViews.get_reward_params, name='rltrainingbasics')
 ]

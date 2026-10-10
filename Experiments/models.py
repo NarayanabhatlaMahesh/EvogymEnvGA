@@ -44,9 +44,6 @@ class Individual(models.Model):
     connections = models.TextField()
     model_path = models.CharField(max_length=255)
 
-    def __str__(self):
-        return f"Robot {self.robo_id} - Gen {self.generation.generation_number} (Fitness: {self.fitness})"
-
 class World(models.Model):
     """Environment layout generated for a generation or specific trial."""
 

@@ -1,3 +1,5 @@
+
+import math
 import json
 import os
 import random
@@ -9,12 +11,13 @@ import pandas as pd
 import numpy as np
 from evogym.world import EvoWorld
 from .models import Generation, Individual, MetricsPerGeneration, MetricsPerRun, MetricsPerRun, World
-from .JsonWorldEnv import JsonWorldEnv
+from .JsonWorldEnv import SimpleTraverseEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from ollama import chat
 from ollama import ChatResponse
 from stable_baselines3 import PPO
+from EnvEvolve.settings import BASE_DIR
 
 class BaseGenerator:
     DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
@@ -35,8 +38,11 @@ class BaseGenerator:
         self.num_objects = num_objects
 
     def gen_world(self):
-        world, occupied = [], set()
+        world, occupied = dict(), set()
         n = self.num_objects
+
+        neighbors_list = set()
+        n_placed=0
 
         while len(world) < n:
             obj = self.gen_object()
@@ -51,13 +57,16 @@ class BaseGenerator:
             h = max(y for _, y in norm_obj) + 1
             placed = None
 
+            print('len(world) is ',len(world))
+
             for _ in range(100):
-                ox = random.randint(0, self.world_w - w)
-                oy = random.randint(0, self.world_h - h)
+                ox = (self.world_w // n) * n_placed
+                oy = random.randint(1, self.world_h - h)
                 translated = {(x + ox, y + oy) for x, y in norm_obj}
 
                 if not (translated & occupied):
                     placed = translated
+                    n_placed+=1
                     break
 
             if placed is None:
@@ -67,17 +76,51 @@ class BaseGenerator:
             
             # Format JSON output inline
             obj_list = list(placed)
-            lookup = {p: i for i, p in enumerate(obj_list)}
-            world.append({
-                "indices": self.get_indices(obj_list),
-                "types": [5] * len(obj_list),
-                "neighbors": [
-                    [lookup[n] for n in self.get_neighbors(v) if n in lookup]
-                    for v in obj_list
-                ],
-            })
+            coord_to_idx = {
+                (x, y): y * self.world_w + x
+                for x, y in obj_list
+            }
 
-        return world
+            flat_indices = [
+                coord_to_idx[voxel]
+                for voxel in obj_list
+            ]
+
+            neighbors = {
+                str(coord_to_idx[voxel]): [
+                    coord_to_idx[n]
+                    for n in self.get_neighbors(voxel)
+                    if n in coord_to_idx
+                ]
+                for voxel in obj_list
+            }
+
+            # neighbors_list = neighbors_list | neighbors
+
+            world[f"obj{len(world)}"] = {
+                "indices": flat_indices,
+                "types": [5] * len(obj_list),
+                "neighbors": neighbors
+            }
+
+        ground_indices = list(range(self.world_w))
+        ground_neighbors = {}
+        for i in ground_indices:
+            nbrs = []
+            if i > 0:
+                nbrs.append(i - 1)
+            if i < self.world_w - 1:
+                nbrs.append(i + 1)
+            ground_neighbors[str(i)] = nbrs
+        world["ground"] = {
+            "indices": ground_indices,
+            "types": [1] * len(ground_indices),
+            "neighbors": ground_neighbors,
+        }
+
+        return {"grid_width": self.world_w,
+                "grid_height": self.world_h,
+                "objects": world}
 
     def gen_object(self):
         target = random.randint(self.min_voxels, self.max_voxels)
@@ -101,7 +144,8 @@ class BaseGenerator:
         return [(x + dx, y + dy) for dx, dy in self.DIRS]
 
     def get_indices(self, obj_list):
-        return [[x, y] for x, y in obj_list]
+        # idx = y * self.world_w + x
+        return [y * self.world_w + x for x, y in obj_list]
 
     def get_island(self, start_voxel, obj):
         """BFS traversal to retrieve a connected cluster (island) of voxels."""
@@ -113,10 +157,8 @@ class BaseGenerator:
                 q.extend([n for n in self.get_neighbors(v) if n in obj and n not in seen])
         return seen
 
-
-
 class VoxelMutator:
-    DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    DIRS = [(1, 0), (-1, 0), (0, 1)]
 
     def __init__(self, default_type: int = 5):
         self.default_type = default_type
@@ -220,12 +262,6 @@ class VoxelMutator:
         else:
             raise ValueError(f"Unknown action: {action}")
         
-
-
-import math
-import random
-
-
 class EvolveExperiment:
 
     def __init__(
@@ -254,17 +290,17 @@ class EvolveExperiment:
         self.elitism_count = elitism_count
         self.selection_strategy = selection_strategy
         self.max_voxel_width = max_voxel_width
-        self.ROBOT_NAME = "roboname"
+        self.ROBOT_NAME = "robot"
         self.base_path = Path(
-            r"C:\Users\numam\EALLMs\EnvGenPrmtOpt\RunExp\TrainingFiles\FilterRobots\Trained_Models_Sample"
+            os.path.join(BASE_DIR, "saved_modelsNEWW")
         )
-        self.csv_path = (r"C:\Users\numam\EALLMs\EnvGenPrmtOpt\EvoPlayground\TraverseLab\Experiments\Utils\excluded_encs.csv")
+        self.parquet_path = Path(os.path.join(BASE_DIR, "static/upsteppers.parquet"))
         self.obj_w=obj_w
         self.obj_h=obj_h
         self.voxel_count_min=voxel_count_min
         self.voxel_count_max=voxel_count_max
         self.obj_count=obj_count    
-        self.model_map = self._load_models()
+        # self.model_map = self._load_models()
         self.experiment = experiment
 
     def parse_array_blocks(self, text):
@@ -272,9 +308,9 @@ class EvolveExperiment:
         return np.array([np.fromstring(a, sep=',', dtype=int) for a in arrays])
 
 
-    def load_robot_from_csv(self, csv_path, env_name, row_idx):
-        print(f"Loading robot from {csv_path}")
-        df = pd.read_csv(csv_path)
+    def load_robot_from_parquet(self, parquet_path, env_name, row_idx):
+        print(f"Loading robot from {parquet_path}")
+        df = pd.read_parquet(parquet_path)
         df = df.where(df['env_name'] == 'ObstacleTraverser-v0').dropna().sort_values(by='reward').reset_index(drop=True)
         print(f"Found {len(df)} robots for environment {env_name}, loading row {row_idx}")
         row = df.iloc[row_idx]
@@ -283,7 +319,7 @@ class EvolveExperiment:
         return body, connections
 
     def _load_models(self):
-        df = pd.read_csv(self.csv_path).reset_index(drop=True)
+        df = pd.read_parquet(self.parquet_path).reset_index(drop=True)
         model_map = {}
         for i in range(len(df)):
             robo_dir = self.base_path / f"Robo{i}"
@@ -296,7 +332,7 @@ class EvolveExperiment:
                 body = self.parse_array_blocks(df.iloc[i]["body"])
                 connections = self.parse_array_blocks(df.iloc[i]["connections"])
             except Exception as e:
-                print(f"CSV parse failed for Robo{i}: {e}")
+                print(f"parquet parse failed for Robo{i}: {e}")
                 continue
             for model_path in model_files:
                 try:
@@ -304,7 +340,7 @@ class EvolveExperiment:
                         "model"         : PPO.load(str(model_path),device="cpu"),
                         "body"          : body,
                         "connections"   : connections,
-                        "env_class"     : JsonWorldEnv,
+                        "env_class"     :SimpleTraverseEnv,
                         "model_path"    : str(model_path),
                     }
                 except Exception as e:
@@ -315,7 +351,7 @@ class EvolveExperiment:
     def get_robot_set(self):
         """returns list of models loaded PPOs"""
         models = {}
-        for i in range(len(pd.read_csv(self.csv_path))):
+        for i in range(len(pd.read_parquet(self.parquet_path))):
             models[i] = PPO.load(self.base_path / f"Robo{i}")
         return models
 
@@ -323,28 +359,31 @@ class EvolveExperiment:
         """Recombines Parent 1 and Parent 2 objects into a child with 1-voxel gaps and applies scaled mutations."""
         p1_objs = parent1["objects"]
         p2_objs = parent2["objects"]
-        child_objs = []
+        child_objs = dict()
         switch = True
         num_objs = math.floor( (self.ground_width + 1) / (self.max_voxel_width + 1))
         n1, n2 = 0, 0
-        while True:
+        iters=0
+        while iters<(len(p1_objs)+len(p2_objs)):
             if switch:
-                if n1 < len(p1_objs):
-                    child_objs.append(p1_objs[n1])
+                if n1+1 < len(p1_objs):
+                    child_objs[f"obj{n1}"]=p1_objs[f"obj{n1}"]
                     n1 += 1
             else:
-                if n2 < len(p2_objs):
-                    child_objs.append(p2_objs[n2])
+                if n2+1 < len(p2_objs):
+                    child_objs[f"obj{n2}"]=p2_objs[f"obj{n2}"]
                     n2 += 1
             switch = not switch  # Toggle parent source
+            iters += 1
             if (len(child_objs) == num_objs or (n1 >= len(p1_objs) and n2 >= len(p2_objs))):
                 break
         mp = int(self.mutation_rate * 10)
         while mp > 0:
-            for obj in child_objs:
+            for obj in child_objs.values():
                 r = random.choice([0, 1])
                 self.mutate(obj, r, not r)
             mp -= 1
+        child_objs["ground"] = parent1["objects"]["ground"]
         return {"grid_width": self.ground_width, "grid_height": self.world_height, "objects": child_objs,}
 
     def mutate(self, obj, r1, r2):
@@ -360,11 +399,11 @@ class EvolveExperiment:
                 obj_h=self.obj_h, min_voxels=self.voxel_count_min, max_voxels=self.voxel_count_max, num_objects=self.obj_count
                 ).gen_world() for _ in range(self.population_size) ]
         for gen in range(self.gen_count):
-            print("candies generated for gen", g)
-            generation = Generation(experiment=self.experiment, generation_number=gen).save()
+            print("candies generated for gen", gen)
+            generation = Generation.objects.create(experiment=self.experiment,generation_number=gen,)
             v = self.run_evogym_evaluator(gen_candies, generation=generation)
-            v.sort(key=lambda x: x["fitness"], reverse=True)
-            MetricsPerGeneration.objects.create(experiment=self.experiment, generation=generation, 
+            v.sort(key=lambda x: x["avgfitness"], reverse=True)
+            MetricsPerGeneration.objects.create(generation=generation, 
                                                 avg_fitness=np.mean([x["avgfitness"] for x in v]), best_fitness=np.max([x["best_fitness"] for x in v]),
                                                 avg_objects_crossed=np.mean([x["avg_objects_crossed"] for x in v]), avg_distance_travelled=np.mean([x["avg_distance_travelled"] for x in v]))
             parents = v[: self.elitism_count]
@@ -384,8 +423,8 @@ class EvolveExperiment:
     def run_evogym_evaluator(self, worlds, generation):
         evaluated = []
         for world_desc in worlds:
-            world_json = self.to_object_json(world_desc)
-            World.objects.create(generation=generation, world_json=world_json)
+            world_json = world_desc
+            wrld = World.objects.create(generation=generation, world_json=world_json)
             with tempfile.NamedTemporaryFile(mode="w",suffix=".json",delete=False) as f:
                 json.dump(world_json, f)
                 json_path = f.name
@@ -395,19 +434,25 @@ class EvolveExperiment:
                 robos = Individual.objects.all()
                 for job in robos:
                     print(f"Evaluating robot {job.robo_id} on world {json_path}")
-                    world = EvoWorld.from_json(json_path)
-                    
-                    world.add_from_array( name=self.ROBOT_NAME, structure=job.genome_data["body"], connections=job.genome_data["connections"],
-                        x=1, y=10, )
-                    World.objects.create( generation=generation, world_json=world_json)
-                    env = JsonWorldEnv( world=world, robot_name=self.ROBOT_NAME, total_timesteps=self.timesteps_per_run,)
+                    # print(f"{world_json}")
+                    with open(json_path, "r") as f:
+                        data = json.load(f)
+                    print(data)
+                    world = EvoWorld.from_json(f"{json_path}")
+                    world.add_from_array( name=self.ROBOT_NAME, structure=np.array(json.loads(job.body)), connections=np.array(json.loads(job.connections)),
+                        x=self.ground_width, y=self.world_height, )
+                    env = SimpleTraverseEnv(
+                        body=np.array(json.loads(job.body)),
+                        connections=np.array(json.loads(job.connections)),
+                        path=json_path,)
                     obs, _ = env.reset()
                     start_x = float( env.get_pos_com_obs(self.ROBOT_NAME)[0] )
                     max_x = start_x
                     runs = self.timesteps_per_run
+                    model = PPO.load(job.model_path, device="cpu")
                     while (runs>0):
                         runs -= 1
-                        action, _ = job.model_path.predict( obs, deterministic=True )
+                        action, _ = model.predict( obs, deterministic=True )
                         obs, reward, terminated, truncated, _ = env.step(action)
                         cur_x = float(env.get_pos_com_obs(self.ROBOT_NAME)[0])
                         if cur_x > max_x:
@@ -418,15 +463,17 @@ class EvolveExperiment:
                     distance = max_x - start_x
                     score = distance / self.ground_width
                     fitness_scores.append(score)
+                    num_objs_crossed = self.get_num_objs_crossed(cur_x, world_json)
                     robot_data.append({
                         "model_path": job.model_path,
                         "distance": distance,
                         "score": score,
+                        "objects_crossed": len(num_objs_crossed)
                     })
-                    num_objs_crossed = self.get_num_objs_crossed(distance, world_json)
+                    num_objs_crossed = self.get_num_objs_crossed(json=world_json, travelled=distance)
                     print(f"Robot {job.model_path} crossed {len(num_objs_crossed)} objects in world {json_path}")
                     MetricsPerRun.objects.create(individual=job,
-                        world=World.objects.get(generation=generation, world_json=world_json),
+                        world=wrld,
                         run_number=1,
                         objects_crossed=len(num_objs_crossed),
                         distance_travelled=distance, calculated_fitness=score)
@@ -441,6 +488,7 @@ class EvolveExperiment:
     def get_num_objs_crossed(self, travelled, json):
         width = self.ground_width
         crossed=[]
+        print("json is ",travelled)
         for keys, vals in json['objects'].items():
             max=0
             for i in json['objects'][keys]['indices']:
@@ -451,9 +499,9 @@ class EvolveExperiment:
                 crossed.append(json['objects'][keys])
         return crossed
 
-class Train():
-    def __init__(self, ROBOT_CSV, ROBOT_NAME, PPO_TRAIN_TIMESTEPS, N_ENVS, N_STEPS, BATCH_SIZE, DEVICE, MAX_STEPS):
-        self.ROBOT_CSV = ROBOT_CSV
+class Train:
+    def __init__(self, ROBOT_parquet, ROBOT_NAME, PPO_TRAIN_TIMESTEPS, N_ENVS, N_STEPS, BATCH_SIZE, DEVICE, MAX_STEPS):
+        self.ROBOT_parquet = ROBOT_parquet
         self.ROBOT_NAME = ROBOT_NAME
         self.PPO_TRAIN_TIMESTEPS = PPO_TRAIN_TIMESTEPS
         self.N_ENVS = N_ENVS
@@ -473,7 +521,7 @@ class Train():
         try:
             world = EvoWorld.from_json(path)
 
-            df = pd.read_csv(self.ROBOT_CSV)
+            df = pd.read_parquet(self.ROBOT_parquet)
             row = df.iloc[1]
             body = self.parse_body(row["body"])
             connections = self.parse_connections(row["connections"])
@@ -482,11 +530,11 @@ class Train():
                 name=self.ROBOT_NAME,
                 structure=body,
                 connections=connections,
-                x=1,
-                y=10,
+                x=self.ground_width,
+                y=self.world_height - 1,
             )
 
-            env = DummyVecEnv([lambda: JsonWorldEnv(world=world, robot_name=self.ROBOT_NAME, total_timesteps=self.PPO_TRAIN_TIMESTEPS ) for _ in range(self.N_ENVS)])
+            env = DummyVecEnv([lambda:SimpleTraverseEnv(world=world, robot_name=self.ROBOT_NAME, total_timesteps=self.PPO_TRAIN_TIMESTEPS ) for _ in range(self.N_ENVS)])
             model = PPO( "MlpPolicy",
                 env, n_steps=self.N_STEPS, batch_size=self.BATCH_SIZE, learning_rate=1e-3, device=self.DEVICE, verbose=0, )
             model.learn(total_timesteps=self.PPO_TRAIN_TIMESTEPS)
