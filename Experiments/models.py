@@ -88,3 +88,27 @@ class MetricsPerGeneration(models.Model):
 
     def __str__(self):
         return f"Gen {self.generation.generation_number} Aggregated Summary"
+
+class ExperimentChartPoint(models.Model):
+    experiment = models.ForeignKey(
+        Experiment,
+        on_delete=models.CASCADE,
+        related_name="chart_points",
+    )
+    data_point_num = models.PositiveSmallIntegerField()
+    generation_start = models.IntegerField()
+    generation_end = models.IntegerField()
+
+    best_fitness = models.FloatField()
+    avg_fitness = models.FloatField()
+    avg_objects_crossed = models.FloatField()
+    avg_distance_travelled = models.FloatField()
+
+    class Meta:
+        ordering = ["data_point_num"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["experiment", "data_point_num"],
+                name="unique_experiment_chart_point",
+            )
+        ]

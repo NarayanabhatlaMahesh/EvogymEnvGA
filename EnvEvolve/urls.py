@@ -22,6 +22,7 @@ from evogymRL import views as evogymViews
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('run_experiment/', views.run_experiment, name='home'),
+    path('get_experiments/', views.get_experiments, name='get_experiments'),
     path("api-auth/", include("rest_framework.urls")),
     path('evogymrl/',evogymViews.get_reward_params, name='rltrainingbasics')
 ]

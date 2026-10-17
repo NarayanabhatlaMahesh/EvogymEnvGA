@@ -7,10 +7,11 @@ import re
 import tempfile
 from anyio import Path
 from anyio import Path
+from django.db.models.aggregates import Avg, Max
 import pandas as pd
 import numpy as np
 from evogym.world import EvoWorld
-from .models import Generation, Individual, MetricsPerGeneration, MetricsPerRun, MetricsPerRun, World
+from .models import ExperimentChartPoint, Generation, Individual, MetricsPerGeneration, MetricsPerRun, MetricsPerRun, World
 from .JsonWorldEnv import SimpleTraverseEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -398,13 +399,16 @@ class EvolveExperiment:
         gen_candies = [ BaseGenerator(world_w=self.ground_width, world_h=self.world_height, obj_w=self.obj_w,
                 obj_h=self.obj_h, min_voxels=self.voxel_count_min, max_voxels=self.voxel_count_max, num_objects=self.obj_count
                 ).gen_world() for _ in range(self.population_size) ]
+        robos = Individual.objects.all()
+        if not robos.exists():
+            print("No individuals found. Stopping execution.")
+            return None
         for gen in range(self.gen_count):
             print("candies generated for gen", gen)
             generation = Generation.objects.create(experiment=self.experiment,generation_number=gen,)
             v = self.run_evogym_evaluator(gen_candies, generation=generation)
             v.sort(key=lambda x: x["avgfitness"], reverse=True)
-            MetricsPerGeneration.objects.create(generation=generation, 
-                                                avg_fitness=np.mean([x["avgfitness"] for x in v]), best_fitness=np.max([x["best_fitness"] for x in v]),
+            MetricsPerGeneration.objects.create(generation=generation, avg_fitness=np.mean([x["avgfitness"] for x in v]), best_fitness=np.max([x["best_fitness"] for x in v]),
                                                 avg_objects_crossed=np.mean([x["avg_objects_crossed"] for x in v]), avg_distance_travelled=np.mean([x["avg_distance_travelled"] for x in v]))
             parents = v[: self.elitism_count]
             next_gen = [p["world_data"] for p in parents]
@@ -417,7 +421,42 @@ class EvolveExperiment:
                             break
                 if len(next_gen) >= self.population_size:
                     break
-            gen_candies = next_gen[: self.population_size]
+        gen_candies = next_gen[: self.population_size]
+        
+        gen = Generation.objects.filter(experiment=self.experiment)
+        
+        bins = np.array_split(gen, min(20, len(gen)))
+
+        for data_point_num, generation_bin in enumerate(bins, start=1):
+            if len(generation_bin) == 0:
+                continue
+
+            generation_ids = [g.id for g in generation_bin]
+
+            metrics = MetricsPerGeneration.objects.filter(
+                generation_id__in=generation_ids
+            ).aggregate(
+                best_fitness=Max("best_fitness"),
+                avg_fitness=Avg("avg_fitness"),
+                avg_objects_crossed=Avg("avg_objects_crossed"),
+                avg_distance_travelled=Avg("avg_distance_travelled"),
+            )
+
+            if metrics["avg_fitness"] is None:
+                continue
+
+            ExperimentChartPoint.objects.update_or_create(
+                experiment=self.experiment,
+                data_point_num=data_point_num,
+                defaults={
+                    "generation_start": generation_bin[0].generation_number,
+                    "generation_end": generation_bin[-1].generation_number,
+                    "best_fitness": metrics["best_fitness"] or 0,
+                    "avg_fitness": metrics["avg_fitness"] or 0,
+                    "avg_objects_crossed": metrics["avg_objects_crossed"] or 0,
+                    "avg_distance_travelled": metrics["avg_distance_travelled"] or 0,
+                },
+            )
         return gen_candies
     
     def run_evogym_evaluator(self, worlds, generation):
@@ -432,6 +471,9 @@ class EvolveExperiment:
                 fitness_scores = []
                 robot_data = []
                 robos = Individual.objects.all()
+                if not robos.exists():
+                    print("No individuals found. Stopping execution.",evaluated)
+                    return evaluated
                 for job in robos:
                     print(f"Evaluating robot {job.robo_id} on world {json_path}")
                     # print(f"{world_json}")
@@ -477,6 +519,8 @@ class EvolveExperiment:
                         run_number=1,
                         objects_crossed=len(num_objs_crossed),
                         distance_travelled=distance, calculated_fitness=score)
+                print("Fitness scores:", fitness_scores)
+                print("Fitness scores shape:", np.asarray(fitness_scores).shape)
                 fitness = float(np.mean(fitness_scores))
                 evaluated.append({ "world_data": world_desc,
                     "avgfitness": fitness, "robots": robot_data, 'fitness_scores': fitness_scores, "best_fitness": np.max(fitness_scores), 
